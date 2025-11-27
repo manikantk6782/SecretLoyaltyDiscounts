@@ -1,352 +1,446 @@
-# Encrypted Player Registry · Zama FHEVM
+# Secret Loyalty Discounts
 
-A minimal demo dApp that showcases how to build a privacy‑preserving player registry on top of the **Zama FHEVM**.
+Privacy-preserving loyalty scoring and discount issuance on Zama FHEVM.
 
-Each player registers with:
+This dApp lets merchants run **behavior-based loyalty programs** where:
 
-* a **public name** stored in plaintext (for leaderboards / UX), and
-* a **fully homomorphic encrypted age** stored as an `euint8` in the smart contract.
+* Customers submit a **single encrypted loyalty score** (uint16).
+* The contract compares it against **encrypted tier thresholds** and selects an appropriate **encrypted discount**.
+* The user decrypts their discount locally via Zama’s **Relayer SDK**.
+* Merchants never see your raw score, tier logic, or internal thresholds – only that a discount can be applied.
 
-The age is never revealed on-chain in clear form. The player can decrypt their own age off‑chain using the **Relayer SDK 0.2.0** and an EIP‑712 signature.
-
----
-
-## Tech stack
-
-* **Smart contract**: Solidity `^0.8.24`
-
-  * `@fhevm/solidity` (Zama FHE library)
-  * `SepoliaConfig` from Zama FHEVM config
-* **Frontend**: single‑page HTML app
-
-  * `@zama-fhe/relayer-sdk` **0.2.0** (browser build)
-  * `ethers` **v6** (ESM, `BrowserProvider`, `Contract`)
-* **Network**: Sepolia FHEVM (testnet)
-* **Tooling**: Hardhat + hardhat‑deploy (backend), static web server (frontend)
-
-Frontend entry point lives at:
-
-```text
-frontend/public/index.html
-```
+Built for the Zama FHEVM testnet on **Ethereum Sepolia**.
 
 ---
 
-## Main idea
+## Table of Contents
 
-The dApp demonstrates a simple pattern for Zama FHEVM:
+1. [Concept](#concept)
+2. [How It Works](#how-it-works)
 
-1. The user encrypts sensitive data (age) **in the browser** using the Relayer SDK.
-2. The encrypted value is sent to the smart contract as an `externalEuint8` handle + `proof`.
-3. The contract converts this into an `euint8` and stores it in state.
-4. The user can later:
+   * [Actors](#actors)
+   * [Encrypted Policy Model](#encrypted-policy-model)
+   * [Discount Evaluation](#discount-evaluation)
+3. [Smart Contract](#smart-contract)
 
-   * Inspect the **encrypted age handle** on-chain, and
-   * Use **userDecrypt** with an EIP‑712 signature to recover their age off‑chain.
+   * [Key Data Structures](#key-data-structures)
+   * [Main Functions](#main-functions)
+4. [Frontend App](#frontend-app)
 
-This pattern is reusable for any “profile with private fields” system.
+   * [User Flow](#user-flow)
+   * [Admin Flow](#admin-flow)
+   * [Relayer SDK usage](#relayer-sdk-usage)
+5. [Project Structure](#project-structure)
+6. [Running Locally](#running-locally)
+7. [Security & Privacy Notes](#security--privacy-notes)
+8. [Potential Extensions](#potential-extensions)
 
 ---
 
-## Smart contract overview
+## Concept
 
-Contract name: `EncryptedPlayerRegistry`
+**Problem:** Traditional loyalty programs expose a lot of data:
 
-Key properties:
+* detailed behavior metrics
+* thresholds for tiers
+* exact logic for computing discounts
 
-* Uses only official Zama FHE Solidity library:
+**Goal:** Issue discounts **without revealing**:
 
-  * `import { FHE, euint8, externalEuint8 } from "@fhevm/solidity/lib/FHE.sol";`
-* Extends `SepoliaConfig` for the FHEVM network configuration.
-* Encrypted fields are always stored as `euint8` and **never decrypted on-chain**.
-* Access control over ciphertexts is handled via:
+* the user’s raw loyalty score
+* the merchant’s thresholds and scoring model
+* the reasoning behind why a discount was granted or denied
 
-  * `FHE.allowThis(ciphertext)`
-  * `FHE.allow(ciphertext, user)`
-  * `FHE.makePubliclyDecryptable(ciphertext)` for opt‑in public auditability.
+**Solution:** Use Zama’s FHEVM to keep the entire loyalty policy **encrypted on-chain**, and only decrypt the **final discount** client-side.
 
-### Storage
+High level:
+
+* Merchant defines a *program* with encrypted thresholds & discounts.
+* User submits an encrypted score.
+* Contract computes the matching encrypted discount.
+* User decrypts only the discount via the Relayer SDK.
+
+---
+
+## How It Works
+
+### Actors
+
+* **User**
+
+  * Computes their own loyalty score off-chain (any arbitrary formula).
+  * Encrypts the score via the Relayer SDK and submits it to the contract.
+  * Later decrypts the resulting discount locally in the browser.
+
+* **Merchant / Owner**
+
+  * Owns the `SecretLoyaltyDiscounts` contract.
+  * Configures loyalty programs via encrypted thresholds and discounts.
+  * Never sees cleartext scores or discounts.
+
+---
+
+### Encrypted Policy Model
+
+Each **program** is identified by `programId` (e.g. 1, 2, 3 …).
+
+For each `programId`, the contract stores:
+
+* 3 encrypted **minimum loyalty scores** (tier thresholds)
+* 3 encrypted **discount values** (basis points, e.g. 500 = 5%)
+
+All of these are stored as FHE **euint16**; the contract only works with encrypted values.
+
+---
+
+### Discount Evaluation
+
+When a user calls `submitEncryptedLoyalty(programId, encScore, proof)`:
+
+1. The frontend encrypts the user’s loyalty score using the Relayer SDK and Zama Gateway.
+2. The contract ingests the encrypted score (`externalEuint16`) and converts it to `euint16` using `FHE.fromExternal`.
+3. It compares the encrypted score with encrypted thresholds using FHE comparison operators.
+4. It selects an encrypted discount amount corresponding to the highest tier the user qualifies for.
+5. It stores two encrypted fields in a per-user, per-program mapping:
+
+   * `eScore` – encrypted loyalty score
+   * `eDiscountBps` – encrypted discount in basis points
+6. The contract emits handles that the user can decrypt off-chain via the Relayer.
+
+At no point does the chain see cleartext scores or discount values.
+
+---
+
+## Smart Contract
+
+> Contract name: **`SecretLoyaltyDiscounts`**
+> Network: **Ethereum Sepolia (FHEVM)**
+> Address: `0xa1dc30F21517605E3e8Ee51dF7a7697dD46974BC`
+
+The contract uses Zama’s FHE Solidity library:
 
 ```solidity
-struct Player {
-    bool exists;   // registration flag
-    string name;   // public display name
-    euint8 age;    // encrypted age
-}
-
-mapping(address => Player) private _players;
-address public owner;
+import { FHE, ebool, euint16, externalEuint16 } from "@fhevm/solidity/lib/FHE.sol";
+import { ZamaEthereumConfig } from "@fhevm/solidity/config/ZamaConfig.sol";
 ```
 
-* `name` is stored in the clear.
-* `age` is an encrypted `euint8`.
+### Key Data Structures
 
-### Public / player functions
+* **Owner**
 
-* `registerEncrypted(string name, externalEuint8 ageExt, bytes proof)`
+  * `address public owner` – simple ownable pattern.
 
-  * Encrypt age in the browser using the Relayer SDK.
-  * Call this function with the encrypted handle and proof.
-  * Contract:
+* **ProgramConfig**
 
-    * calls `FHE.fromExternal(ageExt, proof)` → `euint8` ciphertext;
-    * stores it in `_players[msg.sender].age`;
-    * uses `FHE.allowThis` and `FHE.allow(ciphertext, msg.sender)`.
+  * `bool exists` – whether the program is configured.
+  * `euint16 eMinScoreTier1` – encrypted minimum score for tier 1.
+  * `euint16 eMinScoreTier2` – encrypted minimum score for tier 2.
+  * `euint16 eMinScoreTier3` – encrypted minimum score for tier 3.
+  * `euint16 eDiscountTier1` – encrypted discount for tier 1.
+  * `euint16 eDiscountTier2` – encrypted discount for tier 2.
+  * `euint16 eDiscountTier3` – encrypted discount for tier 3.
 
-* `registerPlain(string name, uint8 agePlain)`
+* **UserLoyalty**
 
-  * Dev/demo helper.
-  * Converts plaintext `agePlain` into ciphertext using `FHE.asEuint8` on-chain.
-
-* `updateName(string newName)`
-
-  * Updates only the public `name` field.
-
-* `updateAgeEncrypted(externalEuint8 newAgeExt, bytes proof)`
-
-  * Updates only the encrypted age.
-
-* `isRegistered(address player) -> bool`
-
-  * Returns whether a player has a profile.
-
-* `getPlayer(address player) -> (bool exists, string name, bytes32 ageHandle)`
-
-  * Returns profile metadata and the encrypted age handle (`bytes32`).
-  * `ageHandle` can be fed to public decryption or user decryption off-chain.
-
-* `getMyAgeHandle() -> bytes32`
-
-  * Convenience method to fetch the `bytes32` handle for `msg.sender`’s age.
-
-* `makeMyAgePublic()`
-
-  * Calls `FHE.makePubliclyDecryptable(_players[msg.sender].age)`.
-  * Allows anyone to call `publicDecrypt` on the ciphertext.
-
-### Owner/admin functions
-
-* `owner` / `transferOwnership(address newOwner)`
-
-  * Standard ownership pattern.
-
-* `makePlayerAgePublic(address player)`
-
-  * For audits / demos, owner can force a player’s age to be publicly decryptable.
-
-* `clearPlayer(address player)`
-
-  * Logically clears a player profile.
-  * Sets `exists = false`, wipes `name`, and replaces age with `FHE.asEuint8(0)`.
-  * Avoids using `delete` on `euint8` (not supported).
+  * `euint16 eScore` – encrypted loyalty score submitted by the user.
+  * `euint16 eDiscountBps` – encrypted discount (basis points).
+  * `bool decided` – whether a decision has already been computed.
 
 ---
 
-## Frontend overview
+### Main Functions
 
-The frontend is a single `index.html` with:
+#### Ownership
 
-* A **three‑column layout**:
+* `function transferOwnership(address newOwner) external onlyOwner`
 
-  * Player onboarding (name + encrypted age).
-  * “My profile” section (view profile, update name/age, decrypt age).
-  * Owner console (mark ages public / clear profiles).
-* A **dark neon UI** designed to be visually distinct from other demos.
-* Uses **Relayer SDK 0.2.0** and **ethers v6** via ESM CDNs.
+  * Transfers contract ownership to another address.
 
-Key flows:
+---
 
-### 1. Connect wallet & Relayer
+#### Program configuration (admin only)
 
-* Uses `BrowserProvider(window.ethereum)` from ethers v6.
-* Automatically switches to Sepolia (chain id `0xaa36a7`).
-* Initializes the Relayer with:
+* `function setProgramPolicy(...) external onlyOwner`
 
-```ts
-await initSDK();
-relayer = await createInstance({
-  ...SepoliaConfig,
-  relayerUrl: "https://relayer.testnet.zama.cloud",
-  network: window.ethereum,
-  debug: true,
-});
+  * Takes 6 encrypted values from the Relayer Gateway:
+
+    * 3 encrypted minimum scores
+    * 3 encrypted discounts
+  * Uses `FHE.fromExternal` and `FHE.allowThis` to ingest and persist them.
+
+* `function removeProgram(uint256 programId) external onlyOwner`
+
+  * Disables a program by marking `exists = false`.
+
+* `function getProgramMeta(uint256 programId) external view returns (bool exists)`
+
+  * View-only: says whether a program is configured.
+
+* `function getProgramPolicyHandles(uint256 programId) external view returns (bytes32[6])`
+
+  * Returns handles for the encrypted thresholds & discounts.
+  * Intended for analytics tools or debugging (still encrypted).
+
+---
+
+#### User flow (encrypted)
+
+* `function submitEncryptedLoyalty(uint256 programId, externalEuint16 encScore, bytes calldata proof)`
+
+  * User-facing entry point.
+  * Ingests the encrypted score + proof from the Zama Gateway.
+  * Performs FHE comparisons to determine which discount tier applies.
+  * Stores encrypted score and encrypted discount in `UserLoyalty`.
+  * Grants `FHE.allow` rights so the user can decrypt their own ciphertexts.
+
+* `function getMyLoyaltyHandles(uint256 programId) external view returns (bytes32 scoreHandle, bytes32 discountHandle, bool decided)`
+
+  * Pure view: returns handles for the caller’s latest loyalty decision.
+  * No FHE operations inside – only handle extraction.
+
+* `function getUserDiscountHandle(address user, uint256 programId) external view returns (bytes32 discountHandle, bool decided)`
+
+  * Allows external systems to retrieve the encrypted discount handle for a specific user.
+  * The handle is **not** publicly decryptable – the user still controls decryption via ACL.
+
+---
+
+## Frontend App
+
+The frontend is a **single HTML/JS file** that talks directly to:
+
+* MetaMask / EIP-1193 wallet (via `ethers.js` `BrowserProvider`)
+* Zama Relayer SDK (for encryption & decryption)
+* The deployed `SecretLoyaltyDiscounts` contract
+
+It is designed as a **clean, card-based UI** with clear separation between:
+
+* user view (submit score + decrypt discount)
+* admin view (configure program policies)
+
+### User Flow
+
+1. **Connect wallet**
+
+   * Connect via MetaMask.
+   * UI ensures you’re on **Sepolia** and shows the contract address.
+
+2. **Select a program**
+
+   * Enter `Program ID` or use quick buttons (#1, #2).
+   * Click **“Check on-chain”** to verify whether the program exists.
+
+3. **Submit loyalty score**
+
+   * Enter an integer `0–65535` as your **loyalty score**.
+   * Frontend uses `relayer.createEncryptedInput(CONTRACT_ADDRESS, account)` then `add16(score)` to build encrypted input.
+   * It calls `submitEncryptedLoyalty(programId, handle, proof)`.
+
+4. **Decrypt discount**
+
+   * Click **“Decrypt my discount”**.
+   * Frontend fetches handles via `getMyLoyaltyHandles(programId)`.
+   * It runs `userDecrypt` through the Relayer SDK to decrypt both score & discount.
+   * Only the **discount** is shown, as a percentage (basis points → %).
+
+> The frontend strictly avoids leaking internal values back to the chain.
+
+---
+
+### Admin Flow
+
+1. Connect with the **owner** address.
+2. The UI marks you as `role: owner`.
+3. In the **Admin · Configure loyalty programs** card:
+
+   * Enter `Program ID`.
+   * Fill in:
+
+     * `Tier 1/2/3 min score` (uint16)
+     * `Tier 1/2/3 discount` (uint16 basis points)
+   * Click **“Encrypt & set program policy”**.
+4. The UI:
+
+   * Encrypts all 6 numbers with `createEncryptedInput`, `add16` six times.
+   * Sends all 6 handles + proof to `setProgramPolicy`.
+
+The merchant never handles raw ciphertexts manually—everything is done via the Relayer.
+
+---
+
+### Relayer SDK usage
+
+The frontend uses:
+
+```js
+import { initSDK, createInstance, SepoliaConfig, generateKeypair } from "https://cdn.zama.org/relayer-sdk-js/0.3.0-5/relayer-sdk-js.js";
 ```
 
-### 2. Encrypted registration
+Patterns used:
 
-* User enters `name` + `age`.
-* Frontend calls:
+* **Safe JSON logging** with BigInt:
 
-```ts
-const input = relayer.createEncryptedInput(CONTRACT_ADDRESS, user);
-input.add8(age);                      // age is uint8
-const { handles, inputProof } = await input.encrypt();
+```js
+const safeStringify = (obj) =>
+  JSON.stringify(obj, (k, v) => (typeof v === "bigint" ? v.toString() + "n" : v), 2);
 
-await contract.registerEncrypted(name, handles[0], inputProof);
+function appendLog(...parts) {
+  const msg = parts.map(x =>
+    typeof x === "string" ? x : (() => { try { return safeStringify(x); } catch { return String(x); } })()
+  ).join(" ");
+  console.log("📜[secret-loyalty]", msg);
+}
 ```
 
-### 3. Decrypting age (userDecrypt)
+* **Decrypted value normalization**:
 
-* Frontend calls `getMyAgeHandle()`.
-* Generates an ephemeral keypair with `generateKeypair()`.
-* Builds EIP‑712 data via `relayer.createEIP712(...)`.
-* Uses `signer.signTypedData(...)` (EIP‑712) and then:
+```js
+function normalizeDecryptedValue(v) {
+  if (v == null) return null;
+  if (typeof v === "boolean") return v ? 1n : 0n;
+  if (typeof v === "bigint" || typeof v === "number") return BigInt(v);
+  if (typeof v === "string") return BigInt(v);
+  return BigInt(v.toString());
+}
+```
 
-```ts
-const pairs = [{ handle, contractAddress: CONTRACT_ADDRESS }];
-const result = await relayer.userDecrypt(
+* **userDecrypt flow** (EIP-712 signing):
+
+```js
+const kp = await generateKeypair();
+const startTs = Math.floor(Date.now() / 1000).toString();
+const daysValid = "7";
+
+const eip = relayer.createEIP712(kp.publicKey, [CONTRACT_ADDRESS], startTs, daysValid);
+const sig = await signer.signTypedData(
+  eip.domain,
+  { UserDecryptRequestVerification: eip.types.UserDecryptRequestVerification },
+  eip.message
+);
+
+const userAddr = await signer.getAddress();
+const out = await relayer.userDecrypt(
   pairs,
   kp.privateKey,
   kp.publicKey,
-  sig.replace("0x", ""),
+  sig.replace(/^0x/, ""),
   [CONTRACT_ADDRESS],
-  user,
+  userAddr,
   startTs,
-  daysValid,
+  daysValid
 );
 ```
 
-* Displays the decrypted age **only in the UI**, never sending it back on-chain.
+The result is parsed via a `buildValuePicker` helper that knows how to interpret different Relayer output layouts (`clearValues`, `abiEncodedClearValues`, or map-like structures).
 
 ---
 
-## Project layout
+## Project Structure
 
-A minimal layout (simplified):
+A minimal layout could look like:
 
 ```text
 .
-├── contracts/
-│   └── EncryptedPlayerRegistry.sol
-├── frontend/
-│   └── public/
-│       └── index.html   # the SPA described above
-├── deploy/
-│   └── universal-deploy.ts
-├── hardhat.config.ts
-├── package.json
-└── README.md
+├─ contracts/
+│  └─ SecretLoyaltyDiscounts.sol      # FHEVM loyalty contract
+├─ frontend/
+│  └─ index.html                      # Single-page dApp (this repo’s HTML)
+├─ scripts/
+│  └─ deploy.ts                       # Hardhat (or Foundry) deployment script
+├─ hardhat.config.ts                  # Hardhat configuration (via-IR + optimizer recommended)
+└─ README.md                          # This file
 ```
+
+You can adapt this structure to your existing Hardhat / Foundry setup.
 
 ---
 
-## Installation & setup
+## Running Locally
 
-### 1. Clone & install dependencies
+1. **Install dependencies** (example with Hardhat):
 
 ```bash
-git clone &lt;this-repo-url&gt;
-cd &lt;this-repo-folder&gt;
-
-# Install backend deps (Hardhat, hardhat-deploy, etc.)
+yarn install
+# or
 npm install
 ```
 
-If the frontend uses its own `package.json` inside `frontend/`, also run:
+2. **Configure FHEVM & networks**
+
+Make sure your Hardhat config points to the Zama FHEVM Sepolia-compatible RPC and that the FHEVM Solidity library is installed:
 
 ```bash
-cd frontend
-npm install
-cd ..
+yarn add @fhevm/solidity
 ```
 
-### 2. Environment variables (Hardhat)
-
-In the project root, create a `.env` file (or update an existing one):
+3. **Compile & deploy contract** (example):
 
 ```bash
-SEPOLIA_RPC_URL=https://&lt;your-sepolia-rpc&gt;
-PRIVATE_KEY=0x&lt;your_deployer_private_key&gt;
-
-# Optional for universal-deploy
-CONTRACT_NAME=EncryptedPlayerRegistry
-CONSTRUCTOR_ARGS='[]'
-```
-
-> **Note:** never commit real private keys to Git. Use environment variables or a secure secret manager.
-
-### 3. Compile & deploy the contract
-
-```bash
-npx hardhat clean
 npx hardhat compile
 npx hardhat deploy --network sepolia
 ```
 
-If you use the provided `universal-deploy.ts` script, it will pick up `CONTRACT_NAME` and `CONSTRUCTOR_ARGS` automatically.
+Update the frontend `CONTRACT_ADDRESS` constant with the deployed address.
 
-Make sure the deployed address matches the one used by the frontend (`CONTRACT_ADDRESS` constant in `index.html`).
+4. **Serve the frontend over HTTPS** (recommended)
 
----
+Because the Relayer SDK uses WASM workers and EIP-712 signing, browsers behave best over HTTPS.
 
-## Running the frontend
-
-Since the frontend is a static HTML SPA using WASM and `Cross-Origin-Opener-Policy`, you should serve it via a local HTTP server (not via `file://`).
-
-From the project root:
+For quick local testing you can use something like:
 
 ```bash
-cd frontend/public
-
-# Simple option: use serve (no config needed)
-npx serve .
-
-# or, if you prefer http-server
-# npx http-server .
+npx http-server ./frontend -S -C cert.pem -K key.pem -p 3443
 ```
 
-Then open the printed URL in your browser (e.g. [http://localhost:3000](http://localhost:3000) or [http://127.0.0.1:8080](http://127.0.0.1:8080)).
+Then open:
 
-Requirements:
+```text
+https://localhost:3443
+```
 
-* Browser with EIP‑1193 wallet (MetaMask, Rabby…) connected to **Sepolia**.
-* Zama FHEVM RPC configured in your wallet / Hardhat.
-
----
-
-## How to use the dApp
-
-1. **Connect wallet**
-
-   * Click **“Connect wallet”** in the header.
-   * Approve network switch to Sepolia if prompted.
-
-2. **Register as a player**
-
-   * In **“Player onboarding”** panel:
-
-     * Enter a public display name.
-     * Enter your age (0–255).
-     * Click **“Encrypt & register”**.
-   * Wait for the transaction to confirm.
-
-3. **Inspect your profile**
-
-   * In **“My profile”** panel, click **“Load my profile”**.
-   * You will see:
-
-     * Your name, and
-     * Your encrypted age handle (`bytes32`).
-
-4. **Decrypt your age**
-
-   * Click **“Private decrypt via Relayer”**.
-   * Sign the EIP‑712 message in your wallet.
-   * The decrypted age will appear as a pill in the UI, visible only in your browser.
-
-5. **Owner tools (optional)**
-
-   * If connected as `owner`:
-
-     * Use **“Make age public”** for a target address to enable public decryption.
-     * Use **“Clear profile”** to logically clear a user profile.
+The app will auto-detect the `localhost:3443` proxy and route Relayer traffic through it.
 
 ---
 
+## Security & Privacy Notes
 
+* **All scoring logic is off-chain**
+
+  * The contract never sees how you computed your loyalty score.
+
+* **Encrypted thresholds and discounts**
+
+  * Program policies are stored as FHE ciphertexts.
+  * Contract uses only encrypted comparisons and selections.
+
+* **No public certificates**
+
+  * There is no `enablePublicCertificate`-style call.
+  * Discount handles are ACL-protected; only the user (via `userDecrypt`) can see the discount.
+
+* **Views expose handles only**
+
+  * View functions return `bytes32` handles, never cleartext.
+  * No FHE operations are performed inside views.
+
+* **Reentrancy-safe design**
+
+  * The core update functions are structured to avoid reentrancy issues.
+
+---
+
+## Potential Extensions
+
+Some ideas to extend this prototype:
+
+* **Multi-merchant support** – map `programId` + `merchant` to policies.
+* **Time-bounded programs** – add encrypted or plaintext validity periods per program.
+* **Multi-dimensional scoring** – expand a single score to several encrypted metrics combined under FHE.
+* **Proof-of-usage** – allow users to present discounted purchases without revealing the original score.
+* **Off-chain analytics** – build dashboards that work on encrypted aggregates via public decrypt for aggregate-only stats.
 
 ---
 
 ## License
 
-MIT — feel free to fork, adapt and extend for your own Zama FHEVM demos.
+MIT – use, modify, and build upon this project free
